@@ -153,6 +153,40 @@ class BriaFiboPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             output_height, output_width, _ = image.shape
             assert (output_height, output_width) == (expected_height, expected_width)
 
+    def test_bria_fibo_multi_reference_uses_distinct_rope_time_planes(self):
+        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+        inputs = self.get_dummy_inputs(torch_device)
+        inputs.update(
+            image=[
+                Image.new("RGB", (336, 192), (255, 255, 255)),
+                Image.new("RGB", (160, 96), (0, 0, 0)),
+            ],
+            num_inference_steps=1,
+        )
+        original_forward = pipe.transformer.forward
+        captured_ids = []
+
+        def forward_with_capture(*args, **kwargs):
+            captured_ids.append(kwargs["img_ids"].detach().cpu())
+            return original_forward(*args, **kwargs)
+
+        pipe.transformer.forward = forward_with_capture
+        image = pipe(**inputs).images[0]
+
+        self.assertEqual(image.shape, (192, 336, 3))
+        self.assertEqual(len(captured_ids), 1)
+        time_ids = captured_ids[0][:, 0]
+        self.assertEqual(set(time_ids.tolist()), {0.0, 1.0, 2.0})
+        self.assertEqual((time_ids == 2).sum().item(), (96 // 16) * (160 // 16))
+
+    def test_multi_reference_mask_requires_single_reference(self):
+        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+        inputs = self.get_dummy_inputs(torch_device)
+        inputs["image"] = [inputs["image"], Image.new("RGB", (160, 96), (0, 0, 0))]
+        inputs["mask"] = Image.new("L", (336, 192), 255)
+        with self.assertRaisesRegex(ValueError, "exactly one reference"):
+            pipe(**inputs)
+
     def test_bria_fibo_edit_mask(self):
         pipe = self.pipeline_class(**self.get_dummy_components())
         pipe = pipe.to(torch_device)
