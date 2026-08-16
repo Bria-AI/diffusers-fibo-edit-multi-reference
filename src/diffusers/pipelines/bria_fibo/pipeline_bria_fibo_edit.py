@@ -917,12 +917,14 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 [prompt_attention_mask, latent_attention_mask, image_latent_attention_mask], dim=1
             )
 
-        attention_mask = self.create_attention_matrix(attention_mask)  # batch, seq => batch, seq, seq
-        attention_mask = attention_mask.unsqueeze(dim=1).to(dtype=self.transformer.dtype)  # for head broadcasting
-
         if self._joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
-        self._joint_attention_kwargs["attention_mask"] = attention_mask
+        if attention_mask.bool().all():
+            self._joint_attention_kwargs.pop("attention_mask", None)
+        else:
+            attention_mask = self.create_attention_matrix(attention_mask)  # batch, seq => batch, seq, seq
+            attention_mask = attention_mask.unsqueeze(dim=1).to(dtype=self.transformer.dtype)  # for head broadcasting
+            self._joint_attention_kwargs["attention_mask"] = attention_mask
 
         # Adapt scheduler to dynamic shifting (resolution dependent)
 
