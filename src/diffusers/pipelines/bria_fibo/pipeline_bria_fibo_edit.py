@@ -634,16 +634,6 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         return latents, latent_image_ids
 
-    @staticmethod
-    def _prepare_attention_mask(attention_mask):
-        attention_matrix = torch.einsum("bi,bj->bij", attention_mask, attention_mask)
-
-        # convert to 0 - keep, -inf ignore
-        attention_matrix = torch.where(
-            attention_matrix == 1, 0.0, -torch.inf
-        )  # Apply -inf to ignored tokens for nulling softmax score
-        return attention_matrix
-
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -919,12 +909,15 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         if self._joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
-        if attention_mask.bool().all():
+        attention_mask = attention_mask.bool()
+        if attention_mask.all():
+            # Nothing is padded, so the mask is a no-op; skipping it keeps backends without
+            # mask support (e.g. flash-attn 2/3) usable.
             self._joint_attention_kwargs.pop("attention_mask", None)
         else:
-            attention_mask = self.create_attention_matrix(attention_mask)  # batch, seq => batch, seq, seq
-            attention_mask = attention_mask.unsqueeze(dim=1).to(dtype=self.transformer.dtype)  # for head broadcasting
-            self._joint_attention_kwargs["attention_mask"] = attention_mask
+            # Bool key-padding mask (batch, 1, 1, seq): every real query attends to the same
+            # keys as with a full (seq, seq) matrix, and varlen backends require bool.
+            self._joint_attention_kwargs["attention_mask"] = attention_mask[:, None, None, :]
 
         # Adapt scheduler to dynamic shifting (resolution dependent)
 
@@ -1195,12 +1188,3 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         if max_sequence_length is not None and max_sequence_length > 3000:
             raise ValueError(f"`max_sequence_length` cannot be greater than 3000 but is {max_sequence_length}")
-
-    def create_attention_matrix(self, attention_mask):
-        attention_matrix = torch.einsum("bi,bj->bij", attention_mask, attention_mask)
-
-        # convert to 0 - keep, -inf ignore
-        attention_matrix = torch.where(
-            attention_matrix == 1, 0.0, -torch.inf
-        )  # Apply -inf to ignored tokens for nulling softmax score
-        return attention_matrix
