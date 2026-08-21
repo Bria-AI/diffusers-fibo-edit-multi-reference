@@ -179,6 +179,18 @@ class BriaFiboPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         self.assertEqual(set(time_ids.tolist()), {0.0, 1.0, 2.0})
         self.assertEqual((time_ids == 2).sum().item(), (96 // 16) * (160 // 16))
 
+    def test_batched_prompts_with_multiple_references(self):
+        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+        inputs = self.get_dummy_inputs(torch_device)
+        inputs.update(
+            prompt=[inputs["prompt"], inputs["prompt"].replace("squirrel", "robot")],
+            image=[inputs["image"], Image.new("RGB", (160, 96), (0, 0, 0))],
+            num_inference_steps=2,
+        )
+        images = pipe(**inputs).images
+        self.assertEqual(images.shape, (2, 192, 336, 3))
+        self.assertGreater(np.abs(images[0] - images[1]).max(), 1e-4)
+
     def test_multi_reference_mask_requires_single_reference(self):
         pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
         inputs = self.get_dummy_inputs(torch_device)
