@@ -197,11 +197,11 @@ def _reference_height_width(image, vae_scale_factor):
 
 
 def _vae_safe_size(image, base_resolution=1024, multiple=16):
-    """Resize a PIL reference exactly as the Fibo Edit serving path does.
+    """Resize a PIL reference to VAE-safe dimensions.
 
-    The VAE requires dimensions divisible by 16. Large references are also capped at
-    ``base_resolution`` square pixels before encoding, so each reference keeps its
-    own aspect ratio without producing an unbounded context sequence.
+    Dimensions are rounded to a multiple of 16 (required by the VAE) and large
+    references are capped at ``base_resolution`` square pixels, so each reference
+    keeps its own aspect ratio without producing an unbounded context sequence.
     """
     width, height = image.size
     scale = min(1.0, ((base_resolution * base_resolution) / float(width * height)) ** 0.5)
@@ -212,9 +212,8 @@ def _vae_safe_size(image, base_resolution=1024, multiple=16):
 def _as_reference_images(image):
     """Normalize the edit input to a non-empty list of reference images.
 
-    A list is deliberately interpreted as multiple references, not as a batch. Fibo
-    Edit has no batched-edit API and using a list as a batch previously produced
-    malformed image-id and attention tensors.
+    A list is interpreted as multiple references, not as a batch; Fibo Edit has no
+    batched-edit API.
     """
     if image is None:
         return []
@@ -666,9 +665,10 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         Args:
             prompt (`str` or `List[str]`):
                 The prompt or prompts to guide the image generation.
-            image (`PIL.Image.Image` or `torch.FloatTensor`, *optional*):
-                The image to guide the image generation. If not defined, the pipeline will generate an image from
-                scratch.
+            image (`PIL.Image.Image`, `torch.Tensor`, `np.ndarray`, or a list of them, *optional*):
+                One or more reference images to guide the image generation. A list is interpreted as multiple
+                references (not a batch): each reference is VAE-encoded at its own aspect ratio and placed on its
+                own RoPE time plane 1, 2, ... . If not defined, the pipeline generates an image from scratch.
             mask (`PipelineMaskInput`, *optional*):
                 Optional mask defining the region of `image` to be edited. Pixels covered by the mask are regenerated
                 while the rest of the image is preserved.
@@ -725,7 +725,8 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             max_sequence_length (`int` defaults to 3000): Maximum sequence length to use with the `prompt`.
             do_patching (`bool`, *optional*, defaults to `False`): Whether to use patching.
             _auto_resize (`bool`, *optional*, defaults to `True`):
-                Whether to automatically resize the first reference image to the preferred resolutions.
+                Whether to snap the default output resolution (taken from the first reference image) to the
+                preferred resolutions.
         Examples:
           Returns:
             [`~pipelines.flux.BriaFiboPipelineOutput`] or `tuple`: [`~pipelines.flux.BriaFiboPipelineOutput`] if
@@ -736,11 +737,13 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         references = _as_reference_images(image)
         if height is None or width is None:
             if references:
-                # Output resolution follows the first source image. In a multi-reference
-                # edit, all sources retain their own aspect ratio in the VAE context tail.
+                # Output resolution follows the first reference image; the other
+                # references only condition generation at their own size.
                 image_height, image_width = _reference_height_width(references[0], self.vae_scale_factor)
                 if image_height <= 0 or image_width <= 0:
-                    raise ValueError("Every reference image must be at least one VAE scale-factor (16) in each dimension.")
+                    raise ValueError(
+                        "Every reference image must be at least one VAE scale-factor (16) in each dimension."
+                    )
                 if _auto_resize:
                     image_width, image_height = min(
                         PREFERRED_RESOLUTION[1024 * 1024],
@@ -773,8 +776,8 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         # 2. Define call parameters
 
-        # Queue records may already provide a serialized edit JSON string. Serialize
-        # only dictionaries; serializing a string again changes its tokenization.
+        # Serialize only dictionaries; a string prompt may already be serialized edit
+        # JSON, and serializing it again would change its tokenization.
         if isinstance(prompt, dict):
             prompt = json.dumps(prompt)
         if isinstance(prompt, str):
@@ -785,14 +788,6 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         device = self._execution_device
         if generator is None and seed is not None:
             generator = torch.Generator(device=device).manual_seed(seed)
-
-        # Production pre-encodes multi-reference context before prompt/noise work.
-        # Preserve that operation order as well as its float32 normalization.
-        multi_reference_latents = None
-        if len(references) > 1:
-            multi_reference_latents = [
-                self._encode_multi_reference_image(reference, device) for reference in references
-            ]
 
         lora_scale = (
             self.joint_attention_kwargs.get("scale", None) if self.joint_attention_kwargs is not None else None
@@ -834,9 +829,8 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             # duplicate last layer
             prompt_layers = prompt_layers + [prompt_layers[-1]] * (total_num_layers_transformer - len(prompt_layers))
 
-        # 5. Prepare generated and reference latent variables. A single reference
-        # uses the historic output-sized path. Multiple references are VAE-encoded
-        # at their individual native /16 size and receive RoPE time ids 1, 2, ... .
+        # 5. Prepare generated and reference latent variables. Every reference is
+        # VAE-encoded at its own size and receives RoPE time id 1, 2, ... .
         num_channels_latents = self.transformer.config.in_channels
         if do_patching:
             num_channels_latents = int(num_channels_latents / 4)
@@ -855,34 +849,19 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         reference_latents, reference_ids = [], []
         for reference_index, reference in enumerate(references, start=1):
-            if len(references) == 1:
-                # Preserve the established single-reference preprocessing and arithmetic.
-                reference = self.image_processor.preprocess(reference, height, width)
-                packed, ids = self.prepare_image_latents(
-                    image=reference,
-                    batch_size=prompt_batch_size,
-                    num_channels_latents=num_channels_latents,
-                    height=height,
-                    width=width,
-                    dtype=prompt_embeds.dtype,
-                    device=device,
-                    do_patching=do_patching,
-                    reference_index=reference_index,
-                )
-            else:
-                packed, ids = self._pack_multi_reference_latents(
-                    latent=multi_reference_latents[reference_index - 1],
-                    batch_size=prompt_batch_size,
-                    num_channels_latents=num_channels_latents,
-                    dtype=prompt_embeds.dtype,
-                    device=device,
-                    do_patching=do_patching,
-                    reference_index=reference_index,
-                )
+            latent = self._encode_reference_image(reference, device)
+            packed, ids = self._pack_reference_latents(
+                latent=latent,
+                num_channels_latents=num_channels_latents,
+                dtype=prompt_embeds.dtype,
+                device=device,
+                do_patching=do_patching,
+                reference_index=reference_index,
+            )
             reference_latents.append(packed)
             reference_ids.append(ids)
         if reference_latents:
-            image_latents = torch.cat(reference_latents, dim=1)
+            image_latents = torch.cat(reference_latents, dim=1).repeat(prompt_batch_size, 1, 1)
             latent_image_ids = torch.cat([latent_image_ids, *reference_ids], dim=0)
         else:
             image_latents = None
@@ -1051,98 +1030,52 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         return BriaFiboPipelineOutput(images=image)
 
-    def prepare_image_latents(
-        self,
-        image: torch.Tensor,
-        batch_size: int,
-        num_channels_latents: int,
-        height: int,
-        width: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        do_patching: bool = False,
-        reference_index: int = 1,
-    ):
-        """VAE-encode one reference and pack it as an edit-context token stream."""
-        del height, width, generator  # Shapes come from the VAE output, not requested output dimensions.
-        image = image.to(device=device, dtype=dtype)
-        if image.shape[0] != batch_size:
-            raise ValueError("Reference image batch size must match the prompt batch size.")
-
-        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        image_latents_cthw = self.vae.encode(image.unsqueeze(2)).latent_dist.mean
-        image_latents_cthw = torch.cat([(latent - latents_mean) * latents_std for latent in image_latents_cthw], dim=0)
-        image_latents_bchw = image_latents_cthw[:, :, 0, :, :]
-        image_latent_height, image_latent_width = image_latents_bchw.shape[-2:]
-
-        if do_patching:
-            if image_latent_height % 2 or image_latent_width % 2:
-                raise ValueError("Patched reference latents require even height and width.")
-            image_latents_bsd = self._pack_latents(
-                image_latents_bchw, batch_size, num_channels_latents, image_latent_height, image_latent_width
-            )
-            id_height, id_width = image_latent_height // 2, image_latent_width // 2
-        else:
-            image_latents_bsd = self._pack_latents_no_patch(
-                image_latents_bchw, batch_size, num_channels_latents, image_latent_height, image_latent_width
-            )
-            id_height, id_width = image_latent_height, image_latent_width
-        image_ids = self._prepare_latent_image_ids(batch_size, id_height, id_width, device, dtype)
-        # Fibo Edit conditions on references by placing each source on a distinct
-        # RoPE time plane. Generated image tokens remain on plane zero.
-        image_ids[..., 0] = reference_index
-        return image_latents_bsd, image_ids
-
-    def _encode_multi_reference_image(self, image: PipelineImageInput, device: torch.device):
-        """Return one production-compatible, float32 multi-reference VAE latent."""
+    def _encode_reference_image(self, image: PipelineImageInput, device: torch.device):
+        """VAE-encode one reference at its own size and normalize the latent in float32."""
         vae_dtype = next(self.vae.parameters()).dtype
         if isinstance(image, Image.Image):
             image = _vae_safe_size(image.convert("RGB"))
             pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1).unsqueeze(0)
-            encoded_input = (pixels.to(device=device, dtype=torch.float32) / 255.0 * 2.0 - 1.0)
+            encoded_input = pixels.to(device=device, dtype=torch.float32) / 255.0 * 2.0 - 1.0
         else:
-            # PIL is the production input type. Keep tensor/NumPy support by routing it
-            # through the normal image processor, while retaining production VAE scaling.
             height, width = _reference_height_width(image, self.vae_scale_factor)
             if height <= 0 or width <= 0:
                 raise ValueError("Every reference image must be at least one VAE scale-factor (16) in each dimension.")
-            encoded_input = self.image_processor.preprocess(image, height, width).to(device=device, dtype=torch.float32)
+            encoded_input = self.image_processor.preprocess(image, height, width).to(
+                device=device, dtype=torch.float32
+            )
 
-        latent = self.vae.encode(encoded_input.to(dtype=vae_dtype).unsqueeze(2)).latent_dist.mean[:, :, 0, :, :].float()
+        latent = (
+            self.vae.encode(encoded_input.to(dtype=vae_dtype).unsqueeze(2)).latent_dist.mean[:, :, 0, :, :].float()
+        )
         latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=torch.float32).view(1, -1, 1, 1)
         latents_std = torch.tensor(self.vae.config.latents_std, device=device, dtype=torch.float32).view(1, -1, 1, 1)
         return (latent - latents_mean) / latents_std
 
-    def _pack_multi_reference_latents(
+    def _pack_reference_latents(
         self,
         latent: torch.Tensor,
-        batch_size: int,
         num_channels_latents: int,
         dtype: torch.dtype,
         device: torch.device,
         do_patching: bool = False,
         reference_index: int = 1,
     ):
-        """Pack a pre-encoded multi-reference latent on its own RoPE time plane."""
-        if batch_size != 1:
-            raise ValueError("Fibo Edit multi-reference inputs support one prompt at a time.")
+        """Pack one encoded reference latent as an edit-context token stream."""
         latent_height, latent_width = latent.shape[-2:]
         if do_patching:
             if latent_height % 2 or latent_width % 2:
                 raise ValueError("Patched reference latents require even height and width.")
-            packed = self._pack_latents(latent, batch_size, num_channels_latents, latent_height, latent_width)
+            packed = self._pack_latents(latent, 1, num_channels_latents, latent_height, latent_width)
             id_height, id_width = latent_height // 2, latent_width // 2
         else:
-            packed = self._pack_latents_no_patch(
-                latent, batch_size, num_channels_latents, latent_height, latent_width
-            )
+            packed = self._pack_latents_no_patch(latent, 1, num_channels_latents, latent_height, latent_width)
             id_height, id_width = latent_height, latent_width
-        image_ids = self._prepare_latent_image_ids(batch_size, id_height, id_width, device, dtype)
+        image_ids = self._prepare_latent_image_ids(1, id_height, id_width, device, dtype)
+        # Fibo Edit conditions on references by placing each one on a distinct RoPE
+        # time plane. Generated image tokens remain on plane zero.
         image_ids[..., 0] = reference_index
         return packed.to(dtype=dtype), image_ids
-
 
     def check_inputs(
         self,
