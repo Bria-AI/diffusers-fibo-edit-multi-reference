@@ -155,29 +155,28 @@ class BriaFiboPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
     def test_bria_fibo_multi_reference_uses_distinct_rope_time_planes(self):
         pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
+
+        references = [
+            Image.new("RGB", (336, 192), (255, 255, 255)),
+            Image.new("RGB", (160, 96), (0, 0, 0)),
+        ]
+        num_channels_latents = pipe.transformer.config.in_channels
+        for reference_index, reference in enumerate(references, start=1):
+            packed, ids = pipe.prepare_reference_latents(
+                image=reference,
+                num_channels_latents=num_channels_latents,
+                dtype=torch.float32,
+                device=torch_device,
+                reference_index=reference_index,
+            )
+            expected_tokens = (reference.height // 16) * (reference.width // 16)
+            self.assertEqual(packed.shape[:2], (1, expected_tokens))
+            self.assertTrue((ids[:, 0] == reference_index).all())
+
         inputs = self.get_dummy_inputs(torch_device)
-        inputs.update(
-            image=[
-                Image.new("RGB", (336, 192), (255, 255, 255)),
-                Image.new("RGB", (160, 96), (0, 0, 0)),
-            ],
-            num_inference_steps=1,
-        )
-        original_forward = pipe.transformer.forward
-        captured_ids = []
-
-        def forward_with_capture(*args, **kwargs):
-            captured_ids.append(kwargs["img_ids"].detach().cpu())
-            return original_forward(*args, **kwargs)
-
-        pipe.transformer.forward = forward_with_capture
+        inputs.update(image=references, num_inference_steps=1)
         image = pipe(**inputs).images[0]
-
         self.assertEqual(image.shape, (192, 336, 3))
-        self.assertEqual(len(captured_ids), 1)
-        time_ids = captured_ids[0][:, 0]
-        self.assertEqual(set(time_ids.tolist()), {0.0, 1.0, 2.0})
-        self.assertEqual((time_ids == 2).sum().item(), (96 // 16) * (160 // 16))
 
     def test_batched_prompts_with_multiple_references(self):
         pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)

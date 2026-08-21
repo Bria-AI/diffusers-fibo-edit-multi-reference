@@ -829,9 +829,8 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         reference_latents, reference_ids = [], []
         for reference_index, reference in enumerate(references, start=1):
-            latent = self._encode_reference_image(reference, device)
-            packed, ids = self._pack_reference_latents(
-                latent=latent,
+            packed, ids = self.prepare_reference_latents(
+                image=reference,
                 num_channels_latents=num_channels_latents,
                 dtype=prompt_embeds.dtype,
                 device=device,
@@ -1010,8 +1009,16 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         return BriaFiboPipelineOutput(images=image)
 
-    def _encode_reference_image(self, image: Image.Image, device: torch.device):
-        """VAE-encode one reference at its own size."""
+    def prepare_reference_latents(
+        self,
+        image: Image.Image,
+        num_channels_latents: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        do_patching: bool = False,
+        reference_index: int = 1,
+    ):
+        """VAE-encode one PIL reference at its own size and pack it as an edit-context token stream."""
         vae_dtype = next(self.vae.parameters()).dtype
         image = _vae_safe_size(image.convert("RGB"))
         pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1).unsqueeze(0)
@@ -1020,18 +1027,8 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         latent = self.vae.encode(encoded_input.to(dtype=vae_dtype).unsqueeze(2)).latent_dist.mean[:, :, 0, :, :]
         latents_mean = torch.tensor(self.vae.config.latents_mean, device=device, dtype=latent.dtype).view(1, -1, 1, 1)
         latents_std = torch.tensor(self.vae.config.latents_std, device=device, dtype=latent.dtype).view(1, -1, 1, 1)
-        return (latent - latents_mean) / latents_std
+        latent = (latent - latents_mean) / latents_std
 
-    def _pack_reference_latents(
-        self,
-        latent: torch.Tensor,
-        num_channels_latents: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        do_patching: bool = False,
-        reference_index: int = 1,
-    ):
-        """Pack one encoded reference latent as an edit-context token stream."""
         latent_height, latent_width = latent.shape[-2:]
         if do_patching:
             if latent_height % 2 or latent_width % 2:
