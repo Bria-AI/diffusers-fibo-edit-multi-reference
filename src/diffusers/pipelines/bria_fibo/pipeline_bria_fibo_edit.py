@@ -678,7 +678,7 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
                 if `guidance_scale` is less than `1`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt. Fibo Edit only supports 1.
+                The number of images to generate per prompt.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
@@ -740,7 +740,6 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             prompt=prompt,
             height=height,
             width=width,
-            num_images_per_prompt=num_images_per_prompt,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             max_sequence_length=max_sequence_length,
         )
@@ -1052,14 +1051,11 @@ class BriaFiboEditPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         mask,
         height,
         width,
-        num_images_per_prompt=1,
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
     ):
         if seed is not None and not isinstance(seed, int):
             raise ValueError("Seed must be an integer")
-        if num_images_per_prompt != 1:
-            raise ValueError("Fibo Edit does not support `num_images_per_prompt` other than 1.")
         references = _as_reference_images(image)
         if image is None and mask is not None:
             raise ValueError("If mask is provided, image must also be provided")

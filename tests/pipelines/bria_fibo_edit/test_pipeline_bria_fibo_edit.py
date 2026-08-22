@@ -114,10 +114,6 @@ class BriaFiboPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
         pass
 
     @unittest.skip(reason="Batching is not supported yet")
-    def test_num_images_per_prompt(self):
-        pass
-
-    @unittest.skip(reason="Batching is not supported yet")
     def test_inference_batch_consistent(self):
         pass
 
